@@ -131,13 +131,16 @@ def _singularize(text: str) -> str:
 
 # A strong, consistent style anchor used by EVERY sprite prompt so the hero,
 # obstacle and target all end up looking like they came from the same game.
+# The magenta-background instruction is non-negotiable — our chroma-key
+# post-processing relies on it.
 _STYLE_ANCHOR = (
     "16-bit pixel art sprite, retro arcade style, "
     "Castlevania Symphony of the Night aesthetic, "
     "blocky sharp pixels, no anti-aliasing, vibrant flat colors, "
-    "ONE individual subject completely alone on plain white background, "
+    "ONE individual subject completely alone, "
     "centered, isolated, NO crowd, NO group, NO duplicates, "
-    "side view, no text, no watermark, no signature, no border, no frame"
+    "side view, no text, no watermark, no signature, no border, no frame, "
+    + CHROMA_KEY_PROMPT_HINT
 )
 
 
@@ -205,40 +208,56 @@ def _sdxl_sprite_image(description: str, role: str):
     raise last_exc if last_exc else RuntimeError("SDXL failed after 3 attempts")
 
 
-# Cache a single rembg session globally — initializing it costs ~1s and we want
-# all sprite calls to share it. Lazy-loaded so the import only happens when AI
-# sprites are actually used (and module import stays cheap).
+# Background removal via chroma-key: we ask SDXL to paint each sprite on a
+# bright magenta backdrop, then erase all magenta pixels here in Python.
+# This replaced an earlier rembg/U2Net approach that needed ~250 MB of RAM
+# for onnxruntime + the segmentation model — far too much for Render's free
+# tier (512 MB total). The chroma-key version uses only Pillow + numpy and
+# adds maybe 5 MB of working memory.
 #
-# Model choice: `u2netp` is the lightweight U2Net variant (~4 MB vs ~176 MB for
-# full u2net). Slightly lower segmentation quality but fits comfortably on
-# small hosts like Render's free tier (512 MB RAM). Override via REMBG_MODEL
-# env var if you want full u2net on a beefier machine.
-_REMBG_SESSION = None
-def _get_rembg_session():
-    global _REMBG_SESSION
-    if _REMBG_SESSION is None:
-        from rembg import new_session
-        model_name = os.getenv("REMBG_MODEL", "u2netp")
-        logger.info("Initializing rembg session with model %r…", model_name)
-        _REMBG_SESSION = new_session(model_name)
-    return _REMBG_SESSION
+# Magenta (#FF00FF) was chosen because it almost never appears in real
+# subjects, giving us a wide safety margin when thresholding.
+
+# The exact phrase the SDXL prompt asks for. Put it in one place so the prompt
+# and the chroma-key threshold stay in sync.
+CHROMA_KEY_PROMPT_HINT = (
+    "plain solid bright magenta background, "
+    "uniform #FF00FF color, no other background elements, "
+    "no shadow, no gradient"
+)
 
 
 def _remove_bg_local(pil_image):
-    """Run rembg locally (U2Net via ONNX Runtime) to strip the background.
-    Returns a PIL Image with alpha channel, CROPPED to the visible bounding box
-    so the character/object fills the sprite frame (no transparent padding
-    above/below the visible pixels — otherwise the character looks like it's
-    floating above platforms).
+    """Replace bright-magenta pixels with transparency, then crop to the
+    visible bounding box. The chroma-key tolerances are intentionally wide
+    because SDXL never produces a perfectly uniform magenta — it tends to
+    drift into pink/purple at the edges of the subject.
     """
-    from rembg import remove
-    transparent = remove(pil_image, session=_get_rembg_session())
-    bbox = transparent.getbbox()  # smallest rectangle containing non-transparent pixels
+    import numpy as np
+    from PIL import Image as PILImage
+
+    img = pil_image.convert("RGBA")
+    arr = np.array(img)
+
+    # "Magenta" pixels = high R + B, low G. Wide thresholds catch the
+    # gradient halo SDXL leaves around the subject.
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    is_magenta = (r > 180) & (g < 110) & (b > 180) & ((r.astype(int) + b.astype(int)) - 2 * g.astype(int) > 200)
+
+    # Set alpha to 0 wherever we matched
+    arr[is_magenta, 3] = 0
+
+    out = PILImage.fromarray(arr, mode="RGBA")
+
+    # Crop to non-transparent bbox so the character fills the sprite frame
+    # (no transparent padding around it — that's what made characters look
+    # like they were floating above platforms).
+    bbox = out.getbbox()
     if bbox is None:
-        return transparent  # entirely empty, return as-is
-    cropped = transparent.crop(bbox)
-    logger.info("Sprite cropped %s → %s (removed transparent padding)",
-                transparent.size, cropped.size)
+        return out
+    cropped = out.crop(bbox)
+    logger.info("Sprite chroma-keyed %s → %s (removed magenta background + padding)",
+                out.size, cropped.size)
     return cropped
 
 
