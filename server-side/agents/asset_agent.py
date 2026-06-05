@@ -277,40 +277,65 @@ def _remove_bg_via_hf(pil_image):
 
 
 def _remove_bg_chroma_key(pil_image):
-    """Pure-Python fallback that drops magenta-ish + near-white pixels.
+    """Detect-the-background chroma-key.
 
-    Empirically, SDXL paints our requested "#FF00FF magenta" as a range of
-    pinkish tones — bright ones near the centre of the background and
-    darker, shadowed ones near the corners. The threshold has to catch all
-    of them. We characterise the background as 'R is clearly higher than G,
-    G is the smallest channel, and B sits between G and R'. That's the
-    signature of magenta/pink/red-violet, regardless of brightness, and it
-    doesn't catch normal subject colors like red (B too low), yellow (G too
-    high), green (G dominant), or blue (R too low)."""
+    Strategy: SDXL doesn't reliably honor "use a magenta background" —
+    sometimes it draws taxis on a street, knights on a battlefield, etc.
+    So instead of hardcoding "remove magenta", we SAMPLE the four corners
+    of the image, check whether they're all similar (which means the
+    image has a uniform background), and if so, remove all pixels
+    matching that color within a wide tolerance.
+
+    If the corners disagree (subject extends to corners, or background
+    is gradient/multicolor) we fall back to magenta + near-white masks
+    so we at least catch the standard cases.
+    """
     import numpy as np
     from PIL import Image as PILImage
 
     img = pil_image.convert("RGBA")
-    arr = np.array(img).astype(int)   # int → safe subtraction
-    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    arr = np.array(img).astype(np.int32)
+    h, w = arr.shape[:2]
 
-    # Magenta family. We need to catch:
-    #   bright magenta-pink, e.g. (207, 30, 136)
-    #   dark corner-shadow magenta, e.g. (134, 58, 84)
-    # ...but NOT pure red (255, 0, 0) or red-clothing (200, 30, 40), which
-    # have B near 0. The signature: R clearly higher than G, and B
-    # noticeably above 0 (separates magenta-shadow from red-shadow).
-    is_magenta = (
-        (r > 100)
-        & (g < 100)
-        & (r > g + 60)
-        & (b > 50)
-    )
-    # Near-white / very light backgrounds (rare with new prompt but kept
-    # as a safety net for runs where SDXL ignores the magenta instruction).
-    is_lightbg = (r > 220) & (g > 220) & (b > 220)
+    # Sample 12×12 patches in each corner — averages out noise/grain
+    cs = 12
+    corner_patches = [
+        arr[ :cs,  :cs,  :3],     # top-left
+        arr[ :cs, -cs:,  :3],     # top-right
+        arr[-cs:,  :cs,  :3],     # bottom-left
+        arr[-cs:, -cs:,  :3],     # bottom-right
+    ]
+    corner_means = [p.reshape(-1, 3).mean(axis=0) for p in corner_patches]
 
-    arr[:, :, 3][is_magenta | is_lightbg] = 0
+    # If all four corners are within a tight color distance, that's a
+    # uniform background → use the mean of all corners as the bg color.
+    def _dist(a, b):
+        return float(np.linalg.norm(a - b))
+    pair_dists = [
+        _dist(corner_means[i], corner_means[j])
+        for i in range(4) for j in range(i + 1, 4)
+    ]
+    corners_agree = max(pair_dists) < 70  # generous threshold
+
+    if corners_agree:
+        bg = np.mean(corner_means, axis=0)
+        # Euclidean distance from each pixel to the background color
+        diff = arr[:, :, :3].astype(np.float32) - bg.astype(np.float32)
+        dist = np.sqrt((diff * diff).sum(axis=2))
+        is_bg = dist < 75  # wide tolerance to catch the AA halo around the subject
+        arr[:, :, 3][is_bg] = 0
+        logger.info("chroma-key (corner-sampled): bg≈RGB(%d,%d,%d), removed %d%%",
+                    int(bg[0]), int(bg[1]), int(bg[2]),
+                    int(is_bg.sum() * 100 / (h * w)))
+    else:
+        # Fallback: hardcoded magenta + near-white masks
+        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        is_magenta = (r > 100) & (g < 100) & (r > g + 60) & (b > 50)
+        is_lightbg = (r > 220) & (g > 220) & (b > 220)
+        arr[:, :, 3][is_magenta | is_lightbg] = 0
+        logger.info("chroma-key (fallback, corners disagreed): removed %d%%",
+                    int((is_magenta | is_lightbg).sum() * 100 / (h * w)))
+
     return PILImage.fromarray(arr.astype(np.uint8), mode="RGBA")
 
 
