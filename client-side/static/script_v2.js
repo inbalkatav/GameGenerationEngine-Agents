@@ -142,16 +142,16 @@ class ChatApp {
       const text = data.response ?? '';
 
       // Async generation path. The server kicks off a background thread
-      // and gives us a job_id; we poll /api/job/<id> until done. The
-      // typing indicator stays visible the whole time so the user knows
-      // we're still working.
+      // and gives us a job_id; we poll /api/job/<id> until done.
+      //
+      // We keep the typing indicator visible the whole time and embed the
+      // server's "Generating your game…" message INSIDE it (instead of as
+      // a separate bubble above) so the user sees a single, calm "we're
+      // working on it" UI element rather than two stacked bubbles.
       if (data.type === 'job_started' && data.job_id) {
-        // Show the "Generating your game…" message above the spinner so
-        // the user has context for the wait.
         this._removeTypingIndicator();
-        this._addMessage(text, 'assistant');
         this._messageHistory.push({ role: 'assistant', content: text });
-        this._addTypingIndicator();
+        this._addTypingIndicator(text);
         await this._pollJob(data.job_id);
         return;
       }
@@ -317,7 +317,15 @@ class ChatApp {
   // TYPING INDICATOR (with rotating status text after 5s)
   // ═══════════════════════════════════════════════════════════════════════
 
-  _addTypingIndicator() {
+  /**
+   * Show the typing indicator (3 animated dots) at the bottom of the chat.
+   *
+   * @param {string} [initialMessage=''] — if provided, this text appears
+   *   inside the indicator immediately (no separate bubble needed). Used
+   *   on job_started to show "Generating your game, Inbal…" while the
+   *   background job runs. Rotating fun messages take over after 7s.
+   */
+  _addTypingIndicator(initialMessage = '') {
     const row = document.createElement('div');
     row.className = 'msg-row';
     row.id = 'typing-indicator';
@@ -341,6 +349,10 @@ class ChatApp {
     const status = document.createElement('p');
     status.className = 'typing-status';
     status.setAttribute('aria-live', 'polite');
+    if (initialMessage) {
+      status.style.display = 'block';
+      status.textContent = initialMessage;
+    }
     panel.appendChild(status);
 
     row.appendChild(avatar);
@@ -348,7 +360,9 @@ class ChatApp {
     this._dom.chatMessages.appendChild(row);
     this._scrollToBottom();
 
-    this._startStatusRotation(status);
+    // If we already have an initial message, delay the first rotation by
+    // 7s (instead of 5s) so the user reads the server's message first.
+    this._startStatusRotation(status, !!initialMessage);
   }
 
   _removeTypingIndicator() {
@@ -356,14 +370,24 @@ class ChatApp {
     document.getElementById('typing-indicator')?.remove();
   }
 
-  _startStatusRotation(statusEl) {
-    const messages = [
-      'Generating your game — this takes up to a minute…',
-      'Designing your hero and world…',
-      'Drawing scene art (this is the slow part)…',
-      'Placing platforms and obstacles…',
-      'Almost there — assembling the game…',
-    ];
+  _startStatusRotation(statusEl, hasInitialMessage = false) {
+    // When we already showed the server's "Generating your game…" message,
+    // we drop the first rotation entry (it was redundant) and start with
+    // the more interesting "Designing your hero…".
+    const messages = hasInitialMessage
+      ? [
+          'Designing your hero and world…',
+          'Drawing scene art (this is the slow part)…',
+          'Placing platforms and obstacles…',
+          'Almost there — assembling the game…',
+        ]
+      : [
+          'Generating your game — this takes up to a minute…',
+          'Designing your hero and world…',
+          'Drawing scene art (this is the slow part)…',
+          'Placing platforms and obstacles…',
+          'Almost there — assembling the game…',
+        ];
     let i = 0;
     const showNext = () => {
       statusEl.style.display = 'block';
@@ -371,8 +395,10 @@ class ChatApp {
       i += 1;
       this._statusTimer = setTimeout(showNext, 7000);
     };
-    // Wait 5s before the first message; most requests finish before that
-    this._statusTimer = setTimeout(showNext, 5000);
+    // If we already have an initial message, give the user 7s to read it
+    // before rotating. Otherwise rotate after 5s.
+    const firstDelay = hasInitialMessage ? 7000 : 5000;
+    this._statusTimer = setTimeout(showNext, firstDelay);
   }
 
   _stopStatusRotation() {
@@ -519,19 +545,24 @@ class ChatApp {
   // ═══════════════════════════════════════════════════════════════════════
 
   _scrollToBottom() {
-    // The scroll container is the parent .chat-wrap (it has overflow-y: auto),
-    // not #chat-messages itself — that's just the content inside it.
+    // The scroll container is .chat-wrap (the parent of #chat-messages —
+    // it has overflow-y: auto in style.css). #chat-messages itself is just
+    // the content list inside it.
     //
-    // We defer the scroll to the next animation frame because scrollHeight
-    // can read stale immediately after appendChild — the new node hasn't
-    // been laid out yet, so the browser reports the *old* scrollHeight and
-    // we end up scrolling to "almost-bottom", missing the last message.
-    // Reading scrollHeight in the next frame guarantees layout has happened.
+    // Why three attempts: appendChild makes the new node visible to JS
+    // immediately, but the browser's layout/paint cycle is async. One
+    // requestAnimationFrame is normally enough, but on real Render
+    // deployments (where pixel-font webfonts and slow image decodes shift
+    // heights for several frames after insertion) the chat would scroll
+    // to "almost bottom" and the last message stayed cut off below the
+    // input bar. Scrolling repeatedly across frame boundaries makes the
+    // behavior robust to those late layout shifts.
     const wrap = this._dom.chatMessages.parentElement;
     if (!wrap) return;
-    requestAnimationFrame(() => {
-      wrap.scrollTop = wrap.scrollHeight;
-    });
+    const doScroll = () => { wrap.scrollTop = wrap.scrollHeight; };
+    requestAnimationFrame(doScroll);
+    setTimeout(doScroll, 60);
+    setTimeout(doScroll, 250);
   }
 
   _announce(text) {
