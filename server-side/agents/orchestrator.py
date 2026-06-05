@@ -55,10 +55,12 @@ def generate_game(raw_answers: dict) -> str:
         level_future = pool.submit(level_agent.generate_level,        game_params)
         bg_future    = pool.submit(background_agent.generate_background, game_params, GAMES_FOLDER)
 
-        assets     = asset_future.result(timeout=45)
-        level_data = level_future.result(timeout=45)
-        # Background generation can take 60s on a cold model — give it more headroom
-        bg_url     = bg_future.result(timeout=120)
+        # Asset agent takes the longest on memory-constrained hosts because
+        # the rembg subprocess is serialized (3 × ~30s on Render free tier).
+        # Background and level are quicker (Claude / single API call).
+        assets     = asset_future.result(timeout=300)
+        level_data = level_future.result(timeout=60)
+        bg_url     = bg_future.result(timeout=180)
 
     # ── Step 3: inject into template ──────────────────────────────────────
     logger.info("Orchestrator: Step 3 — Template injection (bg_url=%s)", bg_url)

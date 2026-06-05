@@ -296,7 +296,10 @@ def _remove_bg_via_subprocess(pil_image):
             result = subprocess.run(
                 [sys.executable, _REMBG_WORKER, in_path, out_path],
                 capture_output=True,
-                timeout=60,    # generous; rembg usually takes ~3-5s
+                timeout=180,   # generous for Render's 0.1 CPU — locally ~3s,
+                               # on Render the subprocess startup + onnxruntime
+                               # import + model load + inference can easily
+                               # take 30-60s combined.
                 check=False,
             )
 
