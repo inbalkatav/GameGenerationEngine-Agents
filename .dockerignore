@@ -1,0 +1,33 @@
+# Don't ship local-only stuff into the Docker build context.
+# Big rocks first — these can shave minutes off the build upload step.
+
+# Local venv (gets recreated inside the image)
+venv/
+.venv/
+env/
+
+# Git history isn't needed at runtime
+.git/
+.gitignore
+
+# Local secrets must NEVER end up in the image
+.env
+
+# Cached / generated content — regenerated at runtime
+client-side/static/uploads/
+client-side/static/games/
+client-side/static/cache/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.log

@@ -1,3 +1,14 @@
+---
+title: Storybased Game Maker
+emoji: 🎮
+colorFrom: blue
+colorTo: orange
+sdk: docker
+app_port: 7860
+pinned: false
+short_description: Chat-driven AI tool that generates 2D platform games
+---
+
 # Storybased Game Maker
 
 A web app that turns a chat conversation into a fully playable 2D platform game. The user answers a handful of questions about their hero, world, and goal — and the system generates a standalone HTML platformer with AI-drawn pixel art, an AI-generated background scene, and a level laid out to match the story.
@@ -91,11 +102,27 @@ Open <http://localhost:10000> in your browser.
 
 ## Deployment
 
-Designed for **Render** (free tier supported). Add the two API keys as environment variables on your service dashboard. The repo's `requirements.txt` and `render.yaml` (if present) handle the rest.
+### Hugging Face Spaces (primary — recommended)
 
-Build command: `pip install -r requirements.txt`
-Start command: `python server-side/web_server_v2.py`
-The server listens on `$PORT` (defaults to 10000) on `0.0.0.0`.
+The repo includes a `Dockerfile` and the HF Space metadata at the top of this README. To deploy:
+
+1. Create a new Space at <https://huggingface.co/new-space>:
+   - **SDK**: Docker
+   - **Hardware**: CPU basic (free — 2 vCPU, 16 GB RAM)
+2. Add this repo as a git remote and push:
+   ```bash
+   git remote add hf https://huggingface.co/spaces/<your-username>/<space-name>
+   git push hf main
+   ```
+3. In the Space's **Settings → Variables and secrets**, add:
+   - `ANTHROPIC_API_KEY`
+   - `HF_TOKEN`
+
+The Space builds the Dockerfile, pre-caches the rembg model during build, and serves on port 7860. Game generation typically completes in 30–60 seconds.
+
+### Render (alternative — slower, free tier)
+
+The repo also includes `render.yaml`. Connect the GitHub repo on the Render dashboard and add the same two env vars. Note that Render's free tier (0.1 CPU / 512 MB RAM) is borderline for this workload — generation takes 3–5 minutes and OOM crashes are possible. HF Spaces is preferred.
 
 ## Credits / models used
 

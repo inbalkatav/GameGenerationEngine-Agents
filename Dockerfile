@@ -1,0 +1,59 @@
+# Dockerfile for Hugging Face Spaces deployment.
+#
+# Why HF Spaces instead of Render: free CPU Basic tier gives 2 vCPUs and
+# 16 GB RAM, vs Render free tier's 0.1 vCPU / 512 MB. The rembg sprite
+# pipeline that was OOM'ing on Render has no trouble here.
+#
+# HF Spaces convention:
+#   - Image runs as user UID 1000 ('user'). Running as root throws warnings
+#     and certain file operations fail.
+#   - App must listen on the port declared as `app_port:` in README.md's
+#     YAML frontmatter (we use 7860, the HF default).
+#   - Environment variables (ANTHROPIC_API_KEY, HF_TOKEN) are configured
+#     via the Space's "Variables and secrets" UI, not baked into the image.
+
+FROM python:3.11-slim
+
+# ── System deps ──────────────────────────────────────────────────────────
+# rembg / onnxruntime need libgl1 + libglib2 at runtime for the model
+# loader. Pillow's wheels include their own libs, so nothing extra needed
+# for image I/O.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1-mesa-glx \
+        libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── HF user (UID 1000) ───────────────────────────────────────────────────
+# Create the user up front so all subsequent COPYs land with the right
+# ownership and pip's --user install dir is on $PATH.
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
+WORKDIR /home/user/app
+
+# ── Python deps ──────────────────────────────────────────────────────────
+# Install requirements first (separate layer) so code changes don't
+# invalidate the pip cache.
+COPY --chown=user:user requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Pre-download the u2netp rembg model (~5 MB). Without this, the first
+# sprite of the day stalls ~10-20 s while rembg fetches it from GitHub.
+RUN python -c "from rembg import new_session; new_session('u2netp'); print('u2netp pre-cached')"
+
+# ── App code ─────────────────────────────────────────────────────────────
+COPY --chown=user:user . .
+
+# Some directories are gitignored (cache/uploads/games are runtime-only)
+# but the app expects them to exist. Create them with the right owner.
+RUN mkdir -p client-side/static/uploads \
+             client-side/static/games \
+             client-side/static/cache
+
+# HF Spaces routes external traffic to port 7860 by default. The
+# web_server_v2.py code already reads PORT from the environment.
+ENV PORT=7860
+EXPOSE 7860
+
+CMD ["python", "server-side/web_server_v2.py"]
