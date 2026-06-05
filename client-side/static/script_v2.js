@@ -191,20 +191,54 @@ class ChatApp {
 
   /**
    * Poll /api/job/<id> until the job finishes (or we hit the safety cap).
+   *
    * The server runs game generation in a background thread; this is how
    * we get the result without holding open a 3-minute HTTP request, which
    * Render's proxy would cut at ~100s.
+   *
+   * Resilience strategy:
+   *   - Patient: tolerates 40 consecutive failures (~2.5 min @ 3-10s) before
+   *     giving up. Render's free tier 502s briefly while waking up workers
+   *     or under load.
+   *   - Exponential-ish backoff: after 5 consecutive errors we slow polls
+   *     from 3s → 10s so we're not hammering a struggling server.
+   *   - 404 (server forgot the job) is treated as a hard error — usually
+   *     means the server restarted, so polling forever won't help.
+   *   - Total time cap: ~15 minutes (enough headroom for a 6-min job + recovery).
    */
   async _pollJob(jobId) {
-    const POLL_INTERVAL_MS = 3000;     // every 3 seconds
-    const MAX_POLLS        = 200;      // 200 × 3s = 10 min hard cap
-    let consecutiveErrors  = 0;
+    const FAST_INTERVAL_MS    = 3000;   // healthy polling
+    const SLOW_INTERVAL_MS    = 10000;  // after errors start happening
+    const MAX_TOTAL_MS        = 15 * 60 * 1000;  // 15 minutes
+    const MAX_CONSEC_ERRORS   = 40;     // ≈ 2-7 minutes of failures before quitting
 
-    for (let i = 0; i < MAX_POLLS; i++) {
-      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    const startedAt = Date.now();
+    let consecutiveErrors = 0;
+
+    while (Date.now() - startedAt < MAX_TOTAL_MS) {
+      // Back off to longer interval if we've been seeing errors
+      const interval = consecutiveErrors > 5 ? SLOW_INTERVAL_MS : FAST_INTERVAL_MS;
+      await new Promise((r) => setTimeout(r, interval));
 
       try {
         const resp = await fetch(`/api/job/${jobId}`);
+
+        if (resp.status === 404) {
+          // Server doesn't know this job — restarted between submit and poll.
+          // No amount of waiting will recover it.
+          this._removeTypingIndicator();
+          this._addMessage(
+            'The server restarted before your game finished. Please try again.',
+            'assistant'
+          );
+          return;
+        }
+
+        if (!resp.ok) {
+          // 5xx / proxy errors — count as a transient error
+          throw new Error(`HTTP ${resp.status}`);
+        }
+
         const data = await resp.json();
         consecutiveErrors = 0;
 
@@ -228,15 +262,15 @@ class ChatApp {
         }
         // status === 'working' → keep polling
       } catch (err) {
-        // Transient network errors are normal on Render's free tier
-        // (server sleep/wake, brief drops). Don't give up — just keep
-        // polling until we hit the consecutive-error threshold.
-        console.warn('Job poll failed:', err);
+        // Transient errors: Render free-tier proxies hiccup, server wakes,
+        // network blips. Don't give up easily — the job is almost certainly
+        // still running on the server.
+        console.warn(`Job poll failed (consecutive: ${consecutiveErrors + 1}):`, err);
         consecutiveErrors += 1;
-        if (consecutiveErrors >= 5) {
+        if (consecutiveErrors >= MAX_CONSEC_ERRORS) {
           this._removeTypingIndicator();
           this._addMessage(
-            'Lost connection to the server. Please check your network and try again.',
+            'Lost connection to the server for too long. The game may still be ready — please reload the page and try again.',
             'assistant'
           );
           return;
@@ -244,7 +278,7 @@ class ChatApp {
       }
     }
 
-    // Hit the 10-minute cap
+    // Hit the 15-minute total time cap
     this._removeTypingIndicator();
     this._addMessage(
       'Game generation is taking longer than expected. Please try again in a minute.',

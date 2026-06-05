@@ -35,6 +35,28 @@ app = Flask(
 CORS(app)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Cache-busting helper for static files
+# ──────────────────────────────────────────────────────────────────────────
+# Browsers aggressively cache /static/* responses, which means our JS/CSS
+# changes don't reach users after a deploy until they hard-refresh. To fix
+# this we expose a `static_version()` Jinja function that returns the
+# file's mtime (integer seconds). The HTML appends it as `?v=1717603200`
+# to the script/stylesheet URL — when the file changes, the version
+# changes, the URL changes, and the browser fetches the new copy.
+@app.context_processor
+def _inject_static_version():
+    def static_version(filename: str) -> str:
+        path = os.path.join(app.static_folder, filename)
+        try:
+            return str(int(os.path.getmtime(path)))
+        except OSError:
+            # File missing — fall back to a constant; the browser will at
+            # least try once and Flask will 404 if it really doesn't exist.
+            return "0"
+    return {"static_version": static_version}
+
+
 UPLOAD_FOLDER = os.path.join(app.static_folder, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
