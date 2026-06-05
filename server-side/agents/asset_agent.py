@@ -129,49 +129,52 @@ def _singularize(text: str) -> str:
     return " ".join(words)
 
 
-# A strong, consistent style anchor used by EVERY sprite prompt so the hero,
-# obstacle and target all end up looking like they came from the same game.
-# The magenta-background instruction is non-negotiable — our chroma-key
-# post-processing (in _remove_bg_local below) relies on it. If you change
-# the background color phrasing here, update the RGB thresholds there too.
+# Style anchor used by EVERY prompt so the hero, obstacle and target look
+# like they belong in the same game.
+#
+# CRITICAL choices:
+# - We DON'T use the word "sprite" — the nscale provider we get routed to
+#   interprets it as "sprite sheet" (a grid of multiple poses).
+# - We DO ask for a bright magenta background — our chroma-key step
+#   (_remove_bg_chroma_key below) relies on this exact color.
 _STYLE_ANCHOR = (
-    "16-bit pixel art sprite, retro arcade style, "
-    "Castlevania Symphony of the Night aesthetic, "
-    "blocky sharp pixels, no anti-aliasing, vibrant flat colors, "
+    "single full-body character illustration, "
+    "retro pixel art video game style, vibrant flat colors, "
     "ONE individual subject completely alone, "
-    "centered, isolated, NO crowd, NO group, NO duplicates, "
+    "centered, isolated, "
+    "no other characters, no duplicates, no crowd, "
     "side view, no text, no watermark, no signature, no border, no frame, "
-    "plain solid bright magenta background, "
-    "uniform #FF00FF color, no other background elements, "
-    "no shadow, no gradient"
+    "background must be plain solid bright magenta color #FF00FF, "
+    "uniform magenta fill, no shadow, no gradient, no other background elements"
 )
 
 
 def _sprite_prompt(description: str, role: str) -> str:
-    """Build a focused prompt asking SDXL for a single side-view sprite.
-    Always singularizes the subject so 'cars' doesn't produce a pair, and
-    repeatedly emphasizes that we want ONE subject only — SDXL has a strong
-    tendency to draw groups (cars in pairs, teachers as a cluster, etc.)."""
+    """Build a focused prompt asking SDXL for a SINGLE-SUBJECT image.
+    Words like 'sprite' and 'sheet' are avoided because some image
+    providers (e.g. nscale via HF router) interpret them as 'sprite sheet'
+    and produce grids of multiple poses. We say 'illustration' / 'figure'
+    instead and let the background-removal step give us transparency."""
     single = _singularize(description)
     if role == "hero":
         return (
-            f"pixel art sprite of exactly ONE {single}, alone, solo hero action pose, "
-            f"full body, facing right, single individual person, {_STYLE_ANCHOR}"
+            f"a single full-body character of {single}, alone, hero standing pose, "
+            f"facing right, one individual person, {_STYLE_ANCHOR}"
         )
     if role == "obstacle":
         return (
-            f"pixel art sprite of exactly ONE {single}, alone, solo, isolated, "
-            f"single individual video game enemy, full body, just one, {_STYLE_ANCHOR}"
+            f"a single full-body illustration of one {single}, alone, isolated, "
+            f"video game enemy, just one, {_STYLE_ANCHOR}"
         )
     if role == "target_rescue":
         return (
-            f"pixel art sprite of exactly ONE {single}, alone, solo character standing, "
-            f"front view, single individual person, {_STYLE_ANCHOR}"
+            f"a single full-body character of {single}, alone, standing front view, "
+            f"one individual person, {_STYLE_ANCHOR}"
         )
     # target_item — a collectible object
     return (
-        f"pixel art sprite of exactly ONE {single}, alone, single item, "
-        f"glowing video game collectible, isolated, {_STYLE_ANCHOR}"
+        f"a single illustration of one {single}, alone, isolated game collectible, "
+        f"{_STYLE_ANCHOR}"
     )
 
 
@@ -184,6 +187,11 @@ def _sdxl_sprite_image(description: str, role: str):
 
     prompt = _sprite_prompt(description, role)
     negative = (
+        # The big ones — block sprite-sheet outputs explicitly
+        "sprite sheet, sprite grid, character sheet, multiple poses, "
+        "character variations, model sheet, pose chart, thumbnail grid, "
+        "side-by-side, collage, comic panels, "
+        # And the usual single-subject hygiene
         "text, watermark, signature, logo, multiple characters, group, crowd, "
         "duplicates, two people, three people, multiple instances, copies, "
         "blurry, photograph, 3d render"
@@ -211,49 +219,99 @@ def _sdxl_sprite_image(description: str, role: str):
     raise last_exc if last_exc else RuntimeError("SDXL failed after 3 attempts")
 
 
-# Background removal via chroma-key: SDXL paints each sprite on a bright
-# magenta backdrop (instructed via the _STYLE_ANCHOR prompt above), then we
-# erase all magenta pixels here in Python. This replaced an earlier
-# rembg/U2Net approach that needed ~250 MB of RAM for onnxruntime + the
-# segmentation model — far too much for Render's free tier (512 MB total).
-# The chroma-key version uses only Pillow + numpy and adds ~5 MB of working
-# memory.
-#
-# Magenta (#FF00FF) was chosen because it almost never appears in real
-# subjects, giving us a wide safety margin when thresholding.
+# Background removal — we try in order:
+#   1. Hugging Face RMBG-1.4 via the router endpoint (best quality, costs an
+#      HF Pro API call). We saw in the logs that router.huggingface.co is
+#      reachable from Render, so this works in production.
+#   2. Numpy chroma-key on bright magenta (cheap fallback, but only works
+#      when SDXL actually painted a magenta background — which the new
+#      nscale provider often doesn't).
+# Both end with a bbox crop so the visible subject fills the frame (otherwise
+# the character looks like it's floating above platforms).
 
 def _remove_bg_local(pil_image):
-    """Replace bright-magenta pixels with transparency, then crop to the
-    visible bounding box. The chroma-key tolerances are intentionally wide
-    because SDXL never produces a perfectly uniform magenta — it tends to
-    drift into pink/purple at the edges of the subject.
-    """
-    import numpy as np
-    from PIL import Image as PILImage
+    """Strip the background from a generated sprite, returning a PIL Image
+    with alpha and cropped to the visible bounding box."""
+    out = None
+    try:
+        out = _remove_bg_via_hf(pil_image)
+    except Exception as exc:
+        logger.warning("HF RMBG failed (%s) — falling back to chroma-key", exc)
+        out = _remove_bg_chroma_key(pil_image)
 
-    img = pil_image.convert("RGBA")
-    arr = np.array(img)
-
-    # "Magenta" pixels = high R + B, low G. Wide thresholds catch the
-    # gradient halo SDXL leaves around the subject.
-    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-    is_magenta = (r > 180) & (g < 110) & (b > 180) & ((r.astype(int) + b.astype(int)) - 2 * g.astype(int) > 200)
-
-    # Set alpha to 0 wherever we matched
-    arr[is_magenta, 3] = 0
-
-    out = PILImage.fromarray(arr, mode="RGBA")
-
-    # Crop to non-transparent bbox so the character fills the sprite frame
-    # (no transparent padding around it — that's what made characters look
-    # like they were floating above platforms).
+    # Crop to non-transparent bbox so sprite fills the frame
     bbox = out.getbbox()
     if bbox is None:
         return out
     cropped = out.crop(bbox)
-    logger.info("Sprite chroma-keyed %s → %s (removed magenta background + padding)",
+    logger.info("Sprite background removed %s → %s (cropped to subject)",
                 out.size, cropped.size)
     return cropped
+
+
+def _remove_bg_via_hf(pil_image):
+    """Call HF's briaai/RMBG-1.4 model via the router endpoint to strip the
+    background. Returns a PIL Image in RGBA mode. Raises on any failure
+    (caller falls through to chroma-key)."""
+    import requests
+    from io import BytesIO
+    from PIL import Image as PILImage
+
+    token = os.getenv("HF_TOKEN")
+    if not token:
+        raise RuntimeError("HF_TOKEN not set")
+
+    buf = BytesIO()
+    pil_image.save(buf, format="PNG")
+
+    resp = requests.post(
+        "https://router.huggingface.co/hf-inference/models/briaai/RMBG-1.4",
+        headers={"Authorization": f"Bearer {token}"},
+        data=buf.getvalue(),
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"RMBG returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+    return PILImage.open(BytesIO(resp.content)).convert("RGBA")
+
+
+def _remove_bg_chroma_key(pil_image):
+    """Pure-Python fallback that drops magenta-ish + near-white pixels.
+
+    Empirically, SDXL paints our requested "#FF00FF magenta" as a range of
+    pinkish tones — bright ones near the centre of the background and
+    darker, shadowed ones near the corners. The threshold has to catch all
+    of them. We characterise the background as 'R is clearly higher than G,
+    G is the smallest channel, and B sits between G and R'. That's the
+    signature of magenta/pink/red-violet, regardless of brightness, and it
+    doesn't catch normal subject colors like red (B too low), yellow (G too
+    high), green (G dominant), or blue (R too low)."""
+    import numpy as np
+    from PIL import Image as PILImage
+
+    img = pil_image.convert("RGBA")
+    arr = np.array(img).astype(int)   # int → safe subtraction
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+
+    # Magenta family. We need to catch:
+    #   bright magenta-pink, e.g. (207, 30, 136)
+    #   dark corner-shadow magenta, e.g. (134, 58, 84)
+    # ...but NOT pure red (255, 0, 0) or red-clothing (200, 30, 40), which
+    # have B near 0. The signature: R clearly higher than G, and B
+    # noticeably above 0 (separates magenta-shadow from red-shadow).
+    is_magenta = (
+        (r > 100)
+        & (g < 100)
+        & (r > g + 60)
+        & (b > 50)
+    )
+    # Near-white / very light backgrounds (rare with new prompt but kept
+    # as a safety net for runs where SDXL ignores the magenta instruction).
+    is_lightbg = (r > 220) & (g > 220) & (b > 220)
+
+    arr[:, :, 3][is_magenta | is_lightbg] = 0
+    return PILImage.fromarray(arr.astype(np.uint8), mode="RGBA")
 
 
 def _ai_one_sprite(description: str, asset_type: str, role: str) -> str:
