@@ -487,16 +487,78 @@ def _remove_bg_chroma_key(pil_image):
 
 def _ai_one_sprite(description: str, asset_type: str, role: str) -> str:
     """Generate one transparent-PNG sprite. Returns its public URL.
-    Cache-aware: identical (description, role) pairs reuse the same file across games.
+
+    Cache-aware: identical (description, role) pairs reuse the same file
+    across games.
+
+    Quality-controlled: each generated sprite is verified by Claude Vision
+    before caching:
+      - If the verdict is GOOD → cache as-is.
+      - If the subject is facing LEFT → flip horizontally (cheap fix —
+        no need to regenerate, the visual content is fine, just mirror it
+        so the game's flip logic plays it back correctly).
+      - If the sprite has structural issues (wrong subject, multiple
+        subjects, incomplete crop) → regenerate, up to MAX_TRIES.
+      - If we exhaust retries → save the last attempt rather than failing
+        the whole game (better something than nothing).
     """
+    from PIL import Image as PILImage
+    # server-side/ is on sys.path (added by web_server_v2.py), so image_vision
+    # is importable as a top-level module here even though it lives next to
+    # the agents/ package rather than inside it.
+    import image_vision
+
     cache_desc = f"{description} | role:{role}"
     hit = asset_cache.lookup(cache_desc, asset_type)
     if hit:
         return hit
 
-    image = _sdxl_sprite_image(description, role)
-    transparent = _remove_bg_local(image)
-    return asset_cache.save(cache_desc, asset_type, transparent)
+    MAX_TRIES = 3
+    last_image = None
+    last_verdict = None
+
+    for attempt in range(1, MAX_TRIES + 1):
+        try:
+            raw = _sdxl_sprite_image(description, role)
+            transparent = _remove_bg_local(raw)
+        except Exception as exc:
+            logger.warning("Sprite gen attempt %d/%d crashed (%s) — retrying",
+                           attempt, MAX_TRIES, exc)
+            continue
+
+        verdict = image_vision.verify_sprite(transparent, description, role)
+
+        # Auto-flip cheap fix: subject is facing the wrong way but is
+        # otherwise fine. Flip the pixels so the cached file faces right
+        # (which is what the game's mirror-on-left-walk logic assumes).
+        if verdict["facing"] == "left":
+            transparent = transparent.transpose(PILImage.FLIP_LEFT_RIGHT)
+            logger.info("Sprite [%s] was facing left — auto-flipped to face right", role)
+            # The flip doesn't change the structural checks (subject, single,
+            # complete), so we keep the verdict's is_acceptable as-is.
+
+        last_image   = transparent
+        last_verdict = verdict
+
+        if verdict["is_acceptable"]:
+            logger.info("Sprite [%s] accepted on attempt %d/%d", role, attempt, MAX_TRIES)
+            return asset_cache.save(cache_desc, asset_type, transparent)
+
+        logger.warning("Sprite [%s] rejected on attempt %d/%d — issues: %s",
+                       role, attempt, MAX_TRIES, verdict["issues"])
+
+    # All retries exhausted. Save the best-effort last attempt rather than
+    # crashing the game generation — the user gets SOMETHING instead of an
+    # error, and the SVG fallback at the outer layer can still cover the
+    # case where every attempt actually crashed.
+    if last_image is not None:
+        logger.warning(
+            "Sprite [%s] using best-effort last attempt (verification never passed: %s)",
+            role, (last_verdict or {}).get("issues"),
+        )
+        return asset_cache.save(cache_desc, asset_type, last_image)
+
+    raise RuntimeError(f"All {MAX_TRIES} attempts to generate {role} sprite failed")
 
 
 def _ai_sprite_urls(game_params: dict) -> dict:

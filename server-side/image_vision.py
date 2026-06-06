@@ -13,8 +13,10 @@ description first, so downstream prompts get meaningful input.
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -104,3 +106,138 @@ def _claude_describe(image_path: str, context: str) -> str:
             break
     logger.info("Image vision: %s → %r", os.path.basename(image_path), description)
     return description
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Sprite quality verification
+# ──────────────────────────────────────────────────────────────────────────
+
+def verify_sprite(pil_image, expected_subject: str, role: str) -> dict:
+    """
+    Inspect a generated sprite and return a structured verdict.
+
+    SDXL is stochastic — even with strong prompts, a percentage of outputs
+    have semantic problems (multiple subjects in one sprite, wrong viewing
+    angle, character facing the wrong way, cropped/incomplete subjects).
+    Rather than tune prompts endlessly to suppress every failure mode, we
+    add a Claude Vision verification step AFTER background removal and
+    BEFORE caching, so we can catch and respond to those failures
+    deterministically: regenerate the bad ones, flip the inverted ones.
+
+    Returns a dict:
+      {
+        "is_acceptable": bool,        # overall verdict — false means regenerate
+        "facing": "right" | "left" | "forward" | "backward" | "unclear",
+        "issues": [list of strings],  # human-readable diagnostic
+      }
+
+    Fail-open: any exception (API down, malformed JSON, etc.) accepts the
+    sprite. We don't want a transient Claude issue to halt game generation
+    for the user; a slightly-imperfect sprite beats no game at all.
+    """
+    try:
+        return _claude_verify_sprite(pil_image, expected_subject, role)
+    except Exception as exc:
+        logger.warning("Sprite verification failed (%s) — accepting sprite", exc)
+        return {"is_acceptable": True, "facing": "unclear", "issues": []}
+
+
+def _claude_verify_sprite(pil_image, expected_subject: str, role: str) -> dict:
+    import anthropic
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+
+    # PNG-encode the PIL image to base64 (preserves alpha channel — Claude
+    # needs to see what the GAME will see, not the raw SDXL output).
+    buf = BytesIO()
+    pil_image.save(buf, format="PNG")
+    image_b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+
+    role_blurb = {
+        "hero":          "the player's hero character",
+        "obstacle":      "an enemy or obstacle the player jumps over",
+        "target_rescue": "a character the player is rescuing",
+        "target_item":   "a collectible item",
+    }.get(role, "a game element")
+
+    prompt = (
+        f"You are reviewing a sprite for a 2D side-scrolling platformer.\n"
+        f"This image should depict ONE \"{expected_subject}\" as {role_blurb}.\n"
+        f"The background has been removed — the subject sits on a transparent canvas.\n\n"
+        f"Respond with ONLY a JSON object (no preamble, no markdown fences):\n"
+        f"{{\n"
+        f'  "is_subject":  true|false,   // recognizable as a "{expected_subject}"\n'
+        f'  "is_single":   true|false,   // exactly ONE subject, no duplicates/lineups\n'
+        f'  "is_complete": true|false,   // full subject visible, not cropped at edges\n'
+        f'  "facing":      "right"|"left"|"forward"|"backward"|"unclear",\n'
+        f'  "notes":       "one short sentence on any quality issue, or empty"\n'
+        f"}}\n\n"
+        f"For \"facing\": if the subject is in side profile, say \"right\" or \"left\".\n"
+        f"If the subject faces the camera, say \"forward\". If turned away, \"backward\".\n"
+        f"For vehicles, \"facing\" is where the FRONT of the vehicle points.\n"
+        f"For non-directional objects (coin, mushroom, gem, flag) use \"unclear\"."
+    )
+
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=200,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+
+    raw = response.content[0].text.strip()
+    # Be forgiving of ```json fences Claude sometimes adds
+    if raw.startswith("```"):
+        raw = raw.strip("`").lstrip("json").strip()
+
+    parsed = json.loads(raw)
+
+    is_acceptable = bool(
+        parsed.get("is_subject")
+        and parsed.get("is_single")
+        and parsed.get("is_complete")
+    )
+
+    issues = []
+    if not parsed.get("is_subject"):
+        issues.append(f"not recognizable as {expected_subject}")
+    if not parsed.get("is_single"):
+        issues.append("multiple subjects in one sprite")
+    if not parsed.get("is_complete"):
+        issues.append("subject cropped or incomplete")
+    notes = (parsed.get("notes") or "").strip()
+    if notes:
+        issues.append(notes)
+
+    facing = parsed.get("facing", "unclear")
+    if facing not in ("right", "left", "forward", "backward", "unclear"):
+        facing = "unclear"
+
+    logger.info(
+        "Sprite verify [%s, %s]: %s, facing=%s%s",
+        role, expected_subject[:30],
+        "OK" if is_acceptable else "REJECT",
+        facing,
+        f", issues={issues}" if issues else "",
+    )
+
+    return {
+        "is_acceptable": is_acceptable,
+        "facing":        facing,
+        "issues":        issues,
+    }
