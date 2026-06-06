@@ -164,7 +164,16 @@ _STYLE_ANCHOR = (
     "ONE individual subject completely alone, "
     "centered, isolated, "
     "no other characters, no duplicates, no crowd, "
-    "side view, no text, no watermark, no signature, no border, no frame, "
+    # Cinematography language — much more specific than "side view".
+    # These terms are well-represented in SDXL's training data (product
+    # photography, side-scroller game art) and reliably override the
+    # top-down / isometric / aerial compositions SDXL otherwise picks
+    # for vehicles and creatures.
+    "side profile shot, horizontal camera angle at eye level, "
+    "ground-level perspective, lateral view, parallel to the camera, "
+    "subject facing right or facing camera, feet on the ground at the "
+    "bottom of the frame, "
+    "no text, no watermark, no signature, no border, no frame, "
     "background must be plain solid white color #FFFFFF, "
     "uniform white fill, no shadow, no gradient, no scene, no environment, "
     "no other background elements"
@@ -189,14 +198,14 @@ def _sprite_prompt(description: str, role: str) -> str:
             f"facing right, one individual person, {_STYLE_ANCHOR}"
         )
     if role == "obstacle":
-        # Extra-aggressive anti-lineup language. The phrases 'close-up',
-        # 'large centered', 'single subject filling frame' are the words
-        # SDXL associates with portrait/macro compositions instead of
-        # catalog rows.
+        # Extra-aggressive anti-lineup language. Avoid the word "portrait"
+        # here because the canvas is landscape — "portrait" was making
+        # SDXL try to compose vertical framings. Use "macro" / "close-up"
+        # / "filling the frame" instead.
         return (
             f"a single large close-up illustration of exactly ONE {single}, "
             f"one big {single} centered and filling the frame, alone, isolated, "
-            f"video game obstacle, just one subject, single object portrait, "
+            f"video game obstacle, just one subject, macro framing, "
             f"no other {single}s anywhere in the image, {_STYLE_ANCHOR}"
         )
     if role == "target_rescue":
@@ -211,6 +220,30 @@ def _sprite_prompt(description: str, role: str) -> str:
     )
 
 
+def _sdxl_dimensions(role: str) -> tuple[int, int]:
+    """Pick (width, height) for the SDXL call based on what we're drawing.
+
+    Aspect ratio is the single biggest lever for steering SDXL toward
+    correct camera angles:
+
+      - Heroes / target characters: portrait (768x1024). Side-profile
+        full-body humans naturally compose into a tall frame, so SDXL
+        rarely picks weird angles when given portrait dimensions.
+
+      - Obstacles: landscape (1024x768). Vehicles, ground creatures, etc.
+        fit horizontally. Squares (768x768) invite top-down compositions
+        because they fit those too — wide canvases force side profile.
+
+      - Target items (collectibles): square (768x768). Items are usually
+        centered icons; either aspect ratio works.
+    """
+    if role == "obstacle":
+        return (1024, 768)
+    if role in ("hero", "target_rescue"):
+        return (768, 1024)
+    return (768, 768)
+
+
 def _sdxl_sprite_image(description: str, role: str):
     """Call SDXL to generate the sprite image. Returns a PIL Image."""
     from huggingface_hub import InferenceClient
@@ -219,15 +252,23 @@ def _sdxl_sprite_image(description: str, role: str):
         raise RuntimeError("HF_TOKEN not set")
 
     prompt = _sprite_prompt(description, role)
+    width, height = _sdxl_dimensions(role)
     negative = (
         # The big ones — block sprite-sheet outputs explicitly
         "sprite sheet, sprite grid, character sheet, multiple poses, "
         "character variations, model sheet, pose chart, thumbnail grid, "
         "side-by-side, collage, comic panels, "
+        # Wrong CAMERA ANGLES — the main semantic failure mode. A taxi
+        # rendered top-down isn't a taxi the player can jump over, it's
+        # a map tile. Block every aerial/non-side composition explicitly.
+        "top-down view, bird's eye view, aerial view, overhead view, "
+        "plan view, isometric view, isometric perspective, blueprint, "
+        "schematic, map view, satellite view, drone shot, "
+        "from above, looking down, perpendicular to ground, "
+        "tilted angle, dutch angle, three-quarter view, "
         # Vehicle/object catalog compositions — the specific failure mode
-        # we hit with obstacle sprites ("yellow taxis" became 3 stacked
-        # variants per sprite). These phrases bias SDXL toward portrait
-        # framing instead of catalog/showcase rows.
+        # we hit earlier with stacked taxis. These phrases bias SDXL
+        # toward portrait framing instead of catalog/showcase rows.
         "vehicle lineup, car lineup, row of cars, row of vehicles, "
         "rows of objects, stacked vehicles, stacked cars, vehicle gallery, "
         "vehicle collection, car catalog, product catalog, "
@@ -248,7 +289,7 @@ def _sdxl_sprite_image(description: str, role: str):
                 prompt=prompt,
                 model="stabilityai/stable-diffusion-xl-base-1.0",
                 negative_prompt=negative,
-                width=768, height=768,
+                width=width, height=height,
             )
         except Exception as e:
             last_exc = e
